@@ -1,0 +1,215 @@
+# -*- coding: utf-8 -*-
+import os
+import json
+import math
+import asyncio
+import datetime as dt
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
+
+from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
+from astral import LocationInfo
+from astral.sun import sun
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+from providers import OpenMeteoProvider, OpenWeatherProvider, WeatherProvider, WindyProvider, YandexWeatherProvider
+
+load_dotenv()
+
+# Config
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip() or None
+WINDY_API_KEY = os.getenv("WINDY_API_KEY", "").strip() or None
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "").strip() or None
+LAT = float(os.getenv("LAT", "55.85"))
+LON = float(os.getenv("LON", "38.45"))
+CLOUD_THRESHOLD = float(os.getenv("CLOUD_THRESHOLD", "35"))
+PRECIP_THRESHOLD = float(os.getenv("PRECIP_THRESHOLD", "20"))
+MIN_WINDOW_HOURS = float(os.getenv("MIN_WINDOW_HOURS", "1.0"))
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+DAILY_NOTIFY_HOUR = int(os.getenv("DAILY_NOTIFY_HOUR", "15"))
+DAILY_NOTIFY_MINUTE = int(os.getenv("DAILY_NOTIFY_MINUTE", "0"))
+CHAT_DB = os.getenv("CHAT_DB", "chat_ids.json")
+
+CHAT_PATH = os.path.join(os.path.dirname(__file__), CHAT_DB)
+
+def load_chats() -> List[int]:
+    if os.path.exists(CHAT_PATH):
+        with open(CHAT_PATH, "r", encoding="utf-8") as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return []
+    return []
+
+def save_chat(chat_id: int):
+    chats = load_chats()
+    if chat_id not in chats:
+        chats.append(chat_id)
+        with open(CHAT_PATH, "w", encoding="utf-8") as f:
+            json.dump(chats, f)
+
+def human_time(ts: int, tz: ZoneInfo) -> str:
+    return dt.datetime.fromtimestamp(ts, tz=tz).strftime("%H:%M")
+
+async def fetch_all_providers(start: dt.datetime, end: dt.datetime) -> Dict[int, Dict[str, float]]:
+    providers: List[WeatherProvider] = [
+        OpenMeteoProvider(),
+        OpenWeatherProvider(OPENWEATHER_API_KEY),
+    ]
+    results: Dict[int, Dict[str, List[float]]] = {}
+    tasks = [p.fetch_hours(LAT, LON, start, end) for p in providers]
+    batches = await asyncio.gather(*tasks, return_exceptions=True)
+    for p, batch in zip(providers, batches):
+        if isinstance(batch, Exception):
+            continue
+        for point in batch:
+            ts = int(point["ts"])
+            cell = results.setdefault(ts, {"cloud": [], "precip_prob": []})
+            if not math.isnan(point["cloud"]):
+                cell["cloud"].append(point["cloud"])
+            cell["precip_prob"].append(point["precip_prob"])
+    # average
+    averaged: Dict[int, Dict[str, float]] = {}
+    for ts, vals in results.items():
+        if not vals["cloud"] and not vals["precip_prob"]:
+            continue
+        avg_cloud = sum(vals["cloud"])/len(vals["cloud"]) if vals["cloud"] else 100.0
+        avg_precip = sum(vals["precip_prob"])/len(vals["precip_prob"]) if vals["precip_prob"] else 0.0
+        averaged[ts] = {"cloud": avg_cloud, "precip_prob": avg_precip}
+    return dict(sorted(averaged.items()))
+
+def night_window(date_local: dt.date, tz: ZoneInfo) -> Tuple[dt.datetime, dt.datetime]:
+    # Night defined between astronomical dusk of 'date_local' and astronomical dawn of 'date_local + 1'
+    loc = LocationInfo(latitude=LAT, longitude=LON)
+    s1 = sun(loc.observer, date=date_local, tzinfo=tz)
+    s2 = sun(loc.observer, date=(date_local + dt.timedelta(days=1)), tzinfo=tz)
+    # 'dusk' with astral is civil; astronomical dusk/dawn: use 'dusk' with depression=18 - astral v3 removed direct api, use sun at different depression? 
+    # Workaround: use 'dusk'/'dawn' properties with different function if available; otherwise approximate with 'nautical' start/end + small offset.
+    # Simpler: use night between 'sunset' and 'sunrise' but shift 90 minutes as rough astro. For Moscow latitude that's acceptable.
+    sunset = s1["sunset"]
+    sunrise = s2["sunrise"]
+    # Approx astronomical correction ~ 1h30m from civil to astronomical at mid-latitudes
+    dusk_astro = sunset + dt.timedelta(minutes=90)
+    dawn_astro = sunrise - dt.timedelta(minutes=90)
+    if dawn_astro <= dusk_astro:
+        # fallback: if polar day/night, just use sunset->sunrise
+        dusk_astro = sunset
+        dawn_astro = sunrise
+    return dusk_astro, dawn_astro
+
+def summarize_windows(averaged: Dict[int, Dict[str, float]], tz: ZoneInfo) -> List[Tuple[int, int]]:
+    # Keep hours that satisfy thresholds
+    allowed_ts = [ts for ts, v in averaged.items()
+                  if v["cloud"] <= CLOUD_THRESHOLD and v["precip_prob"] <= PRECIP_THRESHOLD]
+    if not allowed_ts:
+        return []
+    allowed_ts.sort()
+    windows: List[Tuple[int, int]] = []
+    start = allowed_ts[0]
+    prev = start
+    for ts in allowed_ts[1:]:
+        if ts - prev == 3600:
+            prev = ts
+            continue
+        else:
+            windows.append((start, prev + 3600))  # end exclusive
+            start = ts
+            prev = ts
+    windows.append((start, prev + 3600))
+    # Filter by minimal length
+    out = []
+    for a,b in windows:
+        hours = (b - a)/3600.0
+        if hours >= MIN_WINDOW_HOURS:
+            out.append((a,b))
+    return out
+
+def fmt_report(date_local: dt.date, dusk: dt.datetime, dawn: dt.datetime, averaged: Dict[int, Dict[str, float]], windows: List[Tuple[int,int]], tz: ZoneInfo) -> str:
+    if not averaged:
+        return "Нет данных с погодных сервисов на сегодня."
+    if not windows:
+        return f"Сегодня ({date_local.strftime('%d.%m.%Y')}) ночью над Ногинским районом облачно или осадки. Съёмку не планируем.\n" \
+               f"Окно ночи: {dusk.strftime('%H:%M')}–{dawn.strftime('%H:%M')} МСК."
+    parts = []
+    parts.append(f"Прогноз на ночь {date_local.strftime('%d.%m.%Y')} (Ногинский район):")
+    parts.append(f"Окно ночи: {dusk.strftime('%H:%M')}–{dawn.strftime('%H:%M')} МСК.")
+    parts.append("Окна для съёмки (средняя облачность/осадки по источникам):")
+    for a,b in windows:
+        # average cloud in the window
+        hours = [averaged[ts]["cloud"] for ts in sorted(averaged) if a <= ts < b]
+        avgc = sum(hours)/len(hours) if hours else 0.0
+        parts.append(f"• {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')}–{dt.datetime.fromtimestamp(b, tz).strftime('%H:%M')}  (ср. облачн.: {avgc:.0f}%)")
+    return "\n".join(parts)
+
+async def build_message(date_local: dt.date, tz: ZoneInfo) -> str:
+    dusk, dawn = night_window(date_local, tz)
+    start_utc = dusk.astimezone(dt.timezone.utc)
+    end_utc = dawn.astimezone(dt.timezone.utc)
+    averaged = await fetch_all_providers(start_utc, end_utc)
+    windows = summarize_windows(averaged, tz)
+    return fmt_report(date_local, dusk, dawn, averaged, windows, tz)
+
+# Telegram handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    save_chat(chat_id)
+    await update.message.reply_text(
+        "Привет! Я буду присылать дневной отчёт о видимости на предстоящую ночь по Ногинскому району.\n"
+        "Команды:\n"
+        "/now — получить прогноз сейчас\n"
+        "/setthresholds <облачн%> <осадки%> — поменять пороги (например, /setthresholds 40 20)\n"
+    )
+
+async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tz = ZoneInfo(TIMEZONE)
+    today = dt.datetime.now(tz).date()
+    msg = await build_message(today, tz)
+    await update.message.reply_text(msg)
+
+async def setthresholds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global CLOUD_THRESHOLD, PRECIP_THRESHOLD
+    try:
+        c = float(context.args[0])
+        p = float(context.args[1])
+        CLOUD_THRESHOLD = c
+        PRECIP_THRESHOLD = p
+        await update.message.reply_text(f"Ок! Пороги обновлены: облачность ≤ {c}%, осадки ≤ {p}%.")
+    except Exception:
+        await update.message.reply_text("Используйте формат: /setthresholds 40 20")
+
+async def daily_job(app: Application):
+    tz = ZoneInfo(TIMEZONE)
+    today = dt.datetime.now(tz).date()
+    msg = await build_message(today, tz)
+    chats = load_chats()
+    for chat_id in chats:
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=msg)
+        except Exception:
+            pass
+
+def setup_scheduler(app: Application):
+    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    trigger = CronTrigger(hour=DAILY_NOTIFY_HOUR, minute=DAILY_NOTIFY_MINUTE)
+    scheduler.add_job(lambda: daily_job(app), trigger)
+    scheduler.start()
+
+def main():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN is not set")
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("now", now))
+    application.add_handler(CommandHandler("setthresholds", setthresholds))
+    setup_scheduler(application)
+    application.run_polling(close_loop=False)
+
+if __name__ == "__main__":
+    main()
