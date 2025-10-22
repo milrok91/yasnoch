@@ -3,19 +3,15 @@ import os, json, math, asyncio, threading
 import datetime as dt
 from typing import List, Dict, Tuple
 
-# --- tiny HTTP server for Render Web Service ---
+# keepalive HTTP for Render
 from http.server import BaseHTTPRequestHandler, HTTPServer
-
 def _start_keepalive_server():
     port = int(os.getenv("PORT", "8000"))
     class _H(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200); self.end_headers()
-            self.wfile.write(b"OK")
+        def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
         def log_message(self, *args): return
     srv = HTTPServer(("0.0.0.0", port), _H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-
 _start_keepalive_server()
 
 from dotenv import load_dotenv
@@ -29,14 +25,15 @@ from apscheduler.triggers.cron import CronTrigger
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from providers import OpenMeteoProvider, OpenWeatherProvider, WindyProvider, YandexWeatherProvider, WeatherProvider
+from providers_fixed import OpenMeteoProvider, OpenWeatherProvider, WindyProvider, VisualCrossingProvider, WeatherProvider
 
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENWEATHER_API_KEY = (os.getenv("OPENWEATHER_API_KEY", "") or "").strip() or None
 WINDY_API_KEY = (os.getenv("WINDY_API_KEY", "") or "").strip() or None
-YANDEX_API_KEY = (os.getenv("YANDEX_API_KEY", "") or "").strip() or None
+VISUALCROSSING_API_KEY = (os.getenv("VISUALCROSSING_API_KEY", "") or "").strip() or None
+
 LAT = float(os.getenv("LAT", "55.85"))
 LON = float(os.getenv("LON", "38.45"))
 CLOUD_THRESHOLD = float(os.getenv("CLOUD_THRESHOLD", "35"))
@@ -46,7 +43,7 @@ TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 DAILY_NOTIFY_HOUR = int(os.getenv("DAILY_NOTIFY_HOUR", "15"))
 DAILY_NOTIFY_MINUTE = int(os.getenv("DAILY_NOTIFY_MINUTE", "0"))
 CHAT_DB = os.getenv("CHAT_DB", "chat_ids.json")
-SHOW_SOURCES = os.getenv("SHOW_SOURCES", "0") == "1"  # add footer with providers used
+SHOW_SOURCES = os.getenv("SHOW_SOURCES", "0") == "1"
 
 CHAT_PATH = os.path.join(os.path.dirname(__file__), CHAT_DB)
 
@@ -64,7 +61,7 @@ def save_chat(chat_id: int):
         with open(CHAT_PATH, "w", encoding="utf-8") as f:
             json.dump(chats, f)
 
-def night_window(date_local: dt.date, tz: ZoneInfo) -> Tuple[dt.datetime, dt.datetime]:
+def night_window(date_local: dt.date, tz: ZoneInfo):
     loc = LocationInfo(latitude=LAT, longitude=LON)
     s1 = sun(loc.observer, date=date_local, tzinfo=tz)
     s2 = sun(loc.observer, date=(date_local + dt.timedelta(days=1)), tzinfo=tz)
@@ -75,26 +72,20 @@ def night_window(date_local: dt.date, tz: ZoneInfo) -> Tuple[dt.datetime, dt.dat
     return dusk_astro, dawn_astro
 
 def build_active_providers():
-    providers = []
-    names = []
-    # Always include Open-Meteo (без ключа)
-    providers.append(OpenMeteoProvider()); names.append("Open-Meteo")
-    # Conditionally include OpenWeather
+    providers = [OpenMeteoProvider()]
+    names = ["Open-Meteo"]
     if OPENWEATHER_API_KEY:
         providers.append(OpenWeatherProvider(OPENWEATHER_API_KEY)); names.append("OpenWeather")
-    # Conditionally include Windy
     if WINDY_API_KEY:
         providers.append(WindyProvider(WINDY_API_KEY)); names.append("Windy")
-    # Conditionally include Yandex
-    if YANDEX_API_KEY:
-        providers.append(YandexWeatherProvider(YANDEX_API_KEY)); names.append("Yandex")
+    if VISUALCROSSING_API_KEY:
+        providers.append(VisualCrossingProvider(VISUALCROSSING_API_KEY)); names.append("VisualCrossing")
     return providers, names
 
 async def fetch_all_providers_with_stats(start: dt.datetime, end: dt.datetime):
     providers, names = build_active_providers()
     results: Dict[int, Dict[str, List[float]]] = {}
-    contrib = {n: 0 for n in names}
-    errors = {n: "" for n in names}
+    contrib = {n: 0 for n in names}; errors = {n: "" for n in names}
 
     tasks = [p.fetch_hours(LAT, LON, start, end) for p in providers]
     batches = await asyncio.gather(*tasks, return_exceptions=True)
@@ -123,11 +114,11 @@ async def fetch_all_providers_with_stats(start: dt.datetime, end: dt.datetime):
     averaged = dict(sorted(averaged.items()))
     return averaged, contrib, errors, names
 
-def summarize_windows(averaged: Dict[int, Dict[str, float]], tz: ZoneInfo) -> List[Tuple[int,int]]:
+def summarize_windows(averaged, tz: ZoneInfo):
     allowed_ts = [ts for ts, v in averaged.items() if v["cloud"] <= CLOUD_THRESHOLD and v["precip_prob"] <= PRECIP_THRESHOLD]
     if not allowed_ts: return []
     allowed_ts.sort()
-    windows: List[Tuple[int,int]] = []; start = allowed_ts[0]; prev = start
+    windows = []; start = allowed_ts[0]; prev = start
     for ts in allowed_ts[1:]:
         if ts - prev == 3600: prev = ts
         else: windows.append((start, prev+3600)); start = ts; prev = ts
@@ -137,9 +128,7 @@ def summarize_windows(averaged: Dict[int, Dict[str, float]], tz: ZoneInfo) -> Li
         if (b-a)/3600.0 >= MIN_WINDOW_HOURS: out.append((a,b))
     return out
 
-def fmt_report(date_local: dt.date, dusk: dt.datetime, dawn: dt.datetime,
-               averaged: Dict[int, Dict[str, float]], windows: List[Tuple[int,int]], tz: ZoneInfo,
-               contrib: Dict[str, int], names: List[str]) -> str:
+def fmt_report(date_local: dt.date, dusk: dt.datetime, dawn: dt.datetime, averaged, windows, tz: ZoneInfo, contrib, names):
     if not averaged:
         base = "Нет данных с погодных сервисов на выбранный интервал."
     elif not windows:
@@ -156,13 +145,9 @@ def fmt_report(date_local: dt.date, dusk: dt.datetime, dawn: dt.datetime,
             avgc = sum(hours)/len(hours) if hours else 0.0
             parts.append(f"• {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')}–{dt.datetime.fromtimestamp(b, tz).strftime('%H:%M')}  (ср. облачн.: {avgc:.0f}%)")
         base = "\n".join(parts)
-
-    if SHOW_SOURCES:
+    if os.getenv("SHOW_SOURCES","0")=="1":
         used = [f"{k}:{v}" for k,v in contrib.items() if v > 0]
-        if not used:
-            base += "\n\nИсточник(и): нет данных"
-        else:
-            base += "\n\nИсточник(и): " + ", ".join(used)
+        base += "\n\nИсточник(и): " + (", ".join(used) if used else "нет данных")
     return base
 
 async def build_message(date_local: dt.date, tz: ZoneInfo) -> str:
@@ -172,14 +157,14 @@ async def build_message(date_local: dt.date, tz: ZoneInfo) -> str:
     windows = summarize_windows(averaged, tz)
     return fmt_report(date_local, dusk, dawn, averaged, windows, tz, contrib, names)
 
-# --- Telegram handlers ---
+# Telegram handlers
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_chat(update.effective_chat.id)
     await update.message.reply_text(
         "Привет! Команды:\n"
         "/now — прогноз на ближайшую ночь\n"
         "/tomorrow — прогноз на завтрашнюю ночь\n"
-        "/sources — какие источники дали данные\n"
+        "/sources — активные источники\n"
         "/diag — диагностика провайдеров\n"
         "/setthresholds <облачн%> <осадки%>"
     )
@@ -198,30 +183,21 @@ async def sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz = ZoneInfo(TIMEZONE)
     dusk, dawn = night_window(dt.datetime.now(tz).date(), tz)
     _, contrib, errors, names = await fetch_all_providers_with_stats(dusk.astimezone(dt.timezone.utc), dawn.astimezone(dt.timezone.utc))
-    lines = []
-    for n in names:
-        lines.append(f"{n}: {contrib.get(n,0)} точек" + (f" (ошибка: {errors[n]})" if errors.get(n) else ""))
-    await update.message.reply_text("Источники за ночь:\n" + "\n".join(lines))
+    await update.message.reply_text("Активные источники:\n" + "\n".join([f"{n}: {contrib.get(n,0)} точек" for n in names]))
 
 async def diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz = ZoneInfo(TIMEZONE)
     dusk, dawn = night_window(dt.datetime.now(tz).date(), tz)
     _, contrib, errors, names = await fetch_all_providers_with_stats(dusk.astimezone(dt.timezone.utc), dawn.astimezone(dt.timezone.utc))
-    parts = []
-    for n in names:
-        err = errors.get(n, "")
-        cnt = contrib.get(n, 0)
-        parts.append(f"• {n}: {cnt} точек; " + ("ошибок нет" if not err else f"ошибка: {err}"))
-    await update.message.reply_text("Диагностика провайдеров:\n" + "\n".join(parts))
+    await update.message.reply_text("Диагностика:\n" + "\n".join([f"{n}: {contrib.get(n,0)} точек; " + ("ошибок нет" if not errors.get(n) else f"ошибка: {errors[n]}") for n in names]))
 
-async def setthresholds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global CLOUD_THRESHOLD, PRECIP_THRESHOLD
-    try:
-        c = float(context.args[0]); p = float(context.args[1])
-        CLOUD_THRESHOLD = c; PRECIP_THRESHOLD = p
-        await update.message.reply_text(f"Ок! Пороги: облачность ≤ {c}%, осадки ≤ {p}%.")
-    except Exception:
-        await update.message.reply_text("Используйте формат: /setthresholds 40 20")
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+def setup_scheduler(app: Application):
+    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    trigger = CronTrigger(hour=DAILY_NOTIFY_HOUR, minute=DAILY_NOTIFY_MINUTE)
+    scheduler.add_job(lambda: daily_job(app), trigger)
+    scheduler.start()
 
 async def daily_job(app: Application):
     tz = ZoneInfo(TIMEZONE)
@@ -231,12 +207,6 @@ async def daily_job(app: Application):
         try: await app.bot.send_message(chat_id=chat_id, text=msg)
         except Exception: pass
 
-def setup_scheduler(app: Application):
-    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-    trigger = CronTrigger(hour=DAILY_NOTIFY_HOUR, minute=DAILY_NOTIFY_MINUTE)
-    scheduler.add_job(lambda: daily_job(app), trigger)
-    scheduler.start()
-
 def main():
     if not TELEGRAM_TOKEN: raise RuntimeError("TELEGRAM_TOKEN is not set")
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -245,7 +215,6 @@ def main():
     application.add_handler(CommandHandler("tomorrow", tomorrow))
     application.add_handler(CommandHandler("sources", sources))
     application.add_handler(CommandHandler("diag", diag))
-    application.add_handler(CommandHandler("setthresholds", setthresholds))
     setup_scheduler(application)
     application.run_polling(close_loop=False)
 
