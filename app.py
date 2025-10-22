@@ -1,8 +1,36 @@
 # -*- coding: utf-8 -*-
-import os, json, math, asyncio, datetime as dt
+import os, json, math, asyncio, dt as _dt_import_block, threading
+import datetime as dt
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
+# Tiny HTTP server to keep Render's required port open (keeps service "healthy" in Web Service mode)
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+def _start_keepalive_server():
+    try:
+        port = int(os.getenv("PORT", "8000"))
+    except Exception:
+        port = 8000
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, format, *args):
+            return
+    try:
+        srv = HTTPServer(("0.0.0.0", port), _H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        print(f"[keepalive] HTTP keepalive server started on port {port}")
+    except Exception as e:
+        print(f"[keepalive] Failed to start keepalive server on port {port}: {e}")
+
+# Start keepalive server BEFORE importing blocking stuff
+_start_keepalive_server()
+
+# --- imports used by bot logic ---
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from astral import LocationInfo
@@ -14,7 +42,24 @@ from apscheduler.triggers.cron import CronTrigger
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from providers import OpenMeteoProvider, OpenWeatherProvider, WindyProvider, YandexWeatherProvider, WeatherProvider
+# Providers are expected to be in providers.py next to this file
+try:
+    from providers import OpenMeteoProvider, OpenWeatherProvider, WindyProvider, YandexWeatherProvider, WeatherProvider
+except Exception as e:
+    print("[warn] could not import providers.py:", e)
+    # Fallback minimal stub to avoid crash if providers.py missing
+    class WeatherProvider: pass
+    class OpenMeteoProvider(WeatherProvider):
+        async def fetch_hours(self, *args, **kwargs): return {}
+    class OpenWeatherProvider(WeatherProvider):
+        def __init__(self, key): pass
+        async def fetch_hours(self, *args, **kwargs): return {}
+    class WindyProvider(WeatherProvider):
+        def __init__(self, key): pass
+        async def fetch_hours(self, *args, **kwargs): return {}
+    class YandexWeatherProvider(WeatherProvider):
+        def __init__(self, key): pass
+        async def fetch_hours(self, *args, **kwargs): return {}
 
 load_dotenv()
 
@@ -66,8 +111,12 @@ async def fetch_all_providers(start: dt.datetime, end: dt.datetime) -> Dict[int,
         for point in batch:
             ts = int(point["ts"])
             cell = results.setdefault(ts, {"cloud": [], "precip_prob": []})
-            if not math.isnan(point["cloud"]): cell["cloud"].append(point["cloud"])
-            cell["precip_prob"].append(point["precip_prob"])
+            try:
+                if not math.isnan(point.get("cloud", float("nan"))):
+                    cell["cloud"].append(point.get("cloud", 100.0))
+            except Exception:
+                pass
+            cell["precip_prob"].append(point.get("precip_prob", 0.0))
     averaged: Dict[int, Dict[str, float]] = {}
     for ts, vals in results.items():
         if not vals["cloud"] and not vals["precip_prob"]: continue
