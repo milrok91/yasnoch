@@ -1,40 +1,51 @@
 # -*- coding: utf-8 -*-
-# (see content above) — Full webhook-based app for Render
+# Webhook app without custom web_app route
 
 import os, json, math, asyncio
 import datetime as dt
 from typing import List, Dict, Tuple
+
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from astral import LocationInfo
 from astral.sun import sun
 from astral import moon as amoon
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+
 from providers import OpenMeteoProvider, OpenWeatherProvider, WindyProvider, VisualCrossingProvider, WeatherProvider
 
 load_dotenv()
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 PUBLIC_URL     = os.getenv("PUBLIC_URL")
 WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH")
 PORT           = int(os.getenv("PORT", "8000"))
+
 OPENWEATHER_API_KEY    = (os.getenv("OPENWEATHER_API_KEY", "") or "").strip() or None
 WINDY_API_KEY          = (os.getenv("WINDY_API_KEY", "") or "").strip() or None
 VISUALCROSSING_API_KEY = (os.getenv("VISUALCROSSING_API_KEY", "") or "").strip() or None
+
 LAT  = float(os.getenv("LAT", "55.85"))
 LON  = float(os.getenv("LON", "38.45"))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+
 CLOUD_THRESHOLD   = float(os.getenv("CLOUD_THRESHOLD",   "35"))
 PRECIP_THRESHOLD  = float(os.getenv("PRECIP_THRESHOLD",  "20"))
 MIN_WINDOW_HOURS  = float(os.getenv("MIN_WINDOW_HOURS",  "1.0"))
 CLEAR_NIGHT_THRESHOLD = float(os.getenv("CLEAR_NIGHT_THRESHOLD", "60"))
 SHOW_SOURCES = os.getenv("SHOW_SOURCES", "0") == "1"
+
 DAILY_NOTIFY_HOUR   = int(os.getenv("DAILY_NOTIFY_HOUR",   "15"))
 DAILY_NOTIFY_MINUTE = int(os.getenv("DAILY_NOTIFY_MINUTE", "0"))
+
 USE_MOON_FILTER = os.getenv("USE_MOON_FILTER", "0") == "1"
 MOON_MAX_ILLUM  = float(os.getenv("MOON_MAX_ILLUM",  "40"))
+
 CHAT_DB   = os.getenv("CHAT_DB", "chat_ids.json")
 CHAT_PATH = os.path.join(os.path.dirname(__file__), CHAT_DB)
 
@@ -79,14 +90,17 @@ def moon_info(date_local: dt.date, tz: ZoneInfo):
     age = float(amoon.phase(date_local))
     frac = (1.0 - math.cos(2*math.pi*age/29.530588)) / 2.0
     illum = max(0.0, min(1.0, frac)) * 100.0
+
     def _safe(func, day):
         try: return func(loc.observer, date=day, tzinfo=tz)
         except Exception: return None
+
     rise0 = _safe(amoon.moonrise, date_local)
     set0  = _safe(amoon.moonset,  date_local)
     rise1 = _safe(amoon.moonrise, date_local + dt.timedelta(days=1))
     set1  = _safe(amoon.moonset,  date_local + dt.timedelta(days=1))
-    intervals = []
+
+    intervals: List[Tuple[dt.datetime, dt.datetime]] = []
     if rise0 and set0:
         if rise0 < set0: intervals.append((rise0, set0))
         else:
@@ -103,7 +117,7 @@ def moon_info(date_local: dt.date, tz: ZoneInfo):
 
 def classify_moon_vs_night(dusk: dt.datetime, dawn: dt.datetime, tz: ZoneInfo):
     illum, age, intervals = moon_info(dusk.date(), tz)
-    overlaps = []
+    overlaps: List[Tuple[dt.datetime, dt.datetime]] = []
     for a,b in intervals:
         s = max(a, dusk); e = min(b, dawn)
         if s < e: overlaps.append((s,e))
@@ -130,6 +144,7 @@ async def fetch_all_providers(start: dt.datetime, end: dt.datetime):
     contrib = {n: 0 for n in names}
     tasks = [p.fetch_hours(LAT, LON, start, end) for p in providers]
     batches = await asyncio.gather(*tasks, return_exceptions=True)
+
     import math as _math
     for name, batch in zip(names, batches):
         if isinstance(batch, Exception):
@@ -142,7 +157,8 @@ async def fetch_all_providers(start: dt.datetime, end: dt.datetime):
                 cell["cloud"].append(cloud); contrib[name] += 1
             if "precip_prob" in point:
                 cell["precip_prob"].append(point["precip_prob"])
-    averaged = {}
+
+    averaged: Dict[int, Dict[str, float]] = {}
     for ts, vals in results.items():
         if not vals["cloud"] and not vals["precip_prob"]:
             continue
@@ -153,10 +169,11 @@ async def fetch_all_providers(start: dt.datetime, end: dt.datetime):
     return averaged, contrib, names
 
 def summarize_windows(averaged: Dict[int, Dict[str, float]]) -> List[Tuple[int,int]]:
-    allowed_ts = [ts for ts, v in averaged.items() if v["cloud"] <= CLOUD_THRESHOLD and v["precip_prob"] <= PRECIP_THRESHOLD]
+    allowed_ts = [ts for ts, v in averaged.items()
+                  if v["cloud"] <= CLOUD_THRESHOLD and v["precip_prob"] <= PRECIP_THRESHOLD]
     if not allowed_ts: return []
     allowed_ts.sort()
-    windows = []
+    windows: List[Tuple[int,int]] = []
     start = allowed_ts[0]; prev = start
     for ts in allowed_ts[1:]:
         if ts - prev == 3600: prev = ts
@@ -188,6 +205,7 @@ def fmt_report(date_local: dt.date, dusk: dt.datetime, dawn: dt.datetime,
                tz: ZoneInfo, contrib: Dict[str, int]) -> str:
     clear_pct = compute_clear_fraction(averaged, dusk, dawn)
     header = make_summary_line(clear_pct, windows, tz)
+
     illum, age, intervals, overlaps, status = classify_moon_vs_night(dusk, dawn, tz)
     moon_line = f"Луна: {illum:.0f}% (возраст {age:.1f} д)"
     if status == "над горизонтом" and overlaps:
@@ -198,6 +216,7 @@ def fmt_report(date_local: dt.date, dusk: dt.datetime, dawn: dt.datetime,
         moon_line += " • над горизонтом (вне ночного окна): " + ", ".join(spans)
     else:
         moon_line += " • данные о восходе/заходе недоступны"
+
     if not averaged:
         base = "Нет данных с погодных сервисов на выбранный интервал."
     elif not windows:
@@ -215,9 +234,11 @@ def fmt_report(date_local: dt.date, dusk: dt.datetime, dawn: dt.datetime,
             avgc = sum(hours)/len(hours) if hours else 0.0
             parts.append(f"• {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')}–{dt.datetime.fromtimestamp(b, tz).strftime('%H:%M')}  (ср. облачн.: {avgc:.0f}%)")
         base = "\n".join(parts)
+
     if SHOW_SOURCES:
         used = [f"{k}:{v}" for k,v in contrib.items() if v > 0]
         base += "\n\nИсточник(и): " + (", ".join(used) if used else "нет данных")
+
     return header + "\n\n" + base
 
 async def build_message(date_local: dt.date, tz: ZoneInfo) -> str:
@@ -313,19 +334,13 @@ def main():
     application.add_handler(CommandHandler("setclear", setclear))
     application.add_handler(CommandHandler("moonfilter", moonfilter))
 
-    # add health route
-    from aiohttp import web
-    async def health(request): return web.Response(text="OK")
-    application.web_app.router.add_get("/", health)
-
     setup_scheduler(application)
 
-    # Run webhook (no polling)
     path_clean = WEBHOOK_PATH.strip("/")
     public_clean = PUBLIC_URL.rstrip("/")
     application.run_webhook(
         listen="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
+        port=PORT,
         url_path=path_clean,
         webhook_url=f"{public_clean}/{path_clean}",
         close_loop=False,
