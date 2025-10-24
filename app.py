@@ -419,7 +419,7 @@ def main():
         port=PORT,
         url_path=path_clean,
         webhook_url=f"{public_clean}/{path_clean}",
-        web_app=aio,
+        webhook_app=aio,
         close_loop=False,
         drop_pending_updates=True,
     )
