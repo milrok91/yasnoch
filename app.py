@@ -1,43 +1,11 @@
 # -*- coding: utf-8 -*-
-"""
-YASNOch Telegram astro bot — webhook mode for Render.com (PTB 21.4)
-- Webhook instead of polling (no "Conflict: other getUpdates")
-- aiohttp health route at "/" → 200 OK (for UptimeRobot)
-- APScheduler daily digest (15:00 local by default)
-- Clear-night summary + optional Moon filtering
-- Multi-provider aggregation (Open-Meteo + optional OpenWeather/Windy/VisualCrossing)
-
-Requirements (requirements.txt):
-    python-telegram-bot[webhooks]==21.4
-    apscheduler
-    astral
-    python-dotenv
-
-Environment (Render → Environment):
-    TELEGRAM_TOKEN=...
-    PUBLIC_URL=https://yasnoch.onrender.com
-    WEBHOOK_PATH=hook-<random_string>
-    LAT=55.85
-    LON=38.45
-    TIMEZONE=Europe/Moscow
-    # Optional:
-    # OPENWEATHER_API_KEY=...
-    # WINDY_API_KEY=...
-    # VISUALCROSSING_API_KEY=...
-    # SHOW_SOURCES=1
-    # CLOUD_THRESHOLD=35
-    # PRECIP_THRESHOLD=20
-    # MIN_WINDOW_HOURS=1
-    # CLEAR_NIGHT_THRESHOLD=60
-    # USE_MOON_FILTER=1
-    # MOON_MAX_ILLUM=40
-    # DAILY_NOTIFY_HOUR=15
-    # DAILY_NOTIFY_MINUTE=0
-"""
-
-import os, json, math, asyncio, logging
+# (Full content as in previous cell)
+# To keep output short here, we re-emit the full file.
+# --- begin ---
+import os, json, math, asyncio, logging, threading
 import datetime as dt
 from typing import List, Dict, Tuple
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
@@ -51,58 +19,66 @@ from apscheduler.triggers.cron import CronTrigger
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Providers module must be present in your project root
 from providers import (
     OpenMeteoProvider, OpenWeatherProvider, WindyProvider,
     VisualCrossingProvider, WeatherProvider
 )
 
-# ---------------- Logging ----------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("yasnoch")
 
-# ---------------- Config ----------------
+def _start_keepalive_server():
+    port = int(os.getenv("PORT", "8000"))
+    class _Handler(BaseHTTPRequestHandler):
+        def _ok(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+        def do_GET(self):
+            if self.path in ("/", "/health", "/status"):
+                self._ok(); self.wfile.write(b"OK")
+            else:
+                self.send_response(404); self.end_headers()
+        def do_HEAD(self):
+            if self.path in ("/", "/health", "/status"):
+                self._ok()
+            else:
+                self.send_response(404); self.end_headers()
+        def log_message(self, *args): return
+    try:
+        srv = HTTPServer(("0.0.0.0", port), _Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log.info("Keepalive HTTP started on port %d", port)
+    except Exception as e:
+        log.exception("Failed to start keepalive HTTP: %s", e)
+
+_start_keepalive_server()
+
 load_dotenv()
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-PUBLIC_URL     = os.getenv("PUBLIC_URL")     # e.g. https://yasnoch.onrender.com
-WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH")   # e.g. hook-<random-string>
-PORT           = int(os.getenv("PORT", "8000"))
-
 OPENWEATHER_API_KEY    = (os.getenv("OPENWEATHER_API_KEY", "") or "").strip() or None
 WINDY_API_KEY          = (os.getenv("WINDY_API_KEY", "") or "").strip() or None
 VISUALCROSSING_API_KEY = (os.getenv("VISUALCROSSING_API_KEY", "") or "").strip() or None
-
 LAT  = float(os.getenv("LAT", "55.85"))
 LON  = float(os.getenv("LON", "38.45"))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
-
 CLOUD_THRESHOLD   = float(os.getenv("CLOUD_THRESHOLD",   "35"))
 PRECIP_THRESHOLD  = float(os.getenv("PRECIP_THRESHOLD",  "20"))
 MIN_WINDOW_HOURS  = float(os.getenv("MIN_WINDOW_HOURS",  "1.0"))
 CLEAR_NIGHT_THRESHOLD = float(os.getenv("CLEAR_NIGHT_THRESHOLD", "60"))
 SHOW_SOURCES = os.getenv("SHOW_SOURCES", "0") == "1"
-
 DAILY_NOTIFY_HOUR   = int(os.getenv("DAILY_NOTIFY_HOUR",   "15"))
 DAILY_NOTIFY_MINUTE = int(os.getenv("DAILY_NOTIFY_MINUTE", "0"))
-
 USE_MOON_FILTER = os.getenv("USE_MOON_FILTER", "0") == "1"
 MOON_MAX_ILLUM  = float(os.getenv("MOON_MAX_ILLUM",  "40"))
-
 CHAT_DB   = os.getenv("CHAT_DB", "chat_ids.json")
 CHAT_PATH = os.path.join(os.path.dirname(__file__), CHAT_DB)
 
-# ---------------- Storage (chat list) ----------------
 def load_chats() -> List[int]:
     if os.path.exists(CHAT_PATH):
         with open(CHAT_PATH, "r", encoding="utf-8") as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return []
+            try: return json.load(f)
+            except Exception: return []
     return []
 
 def save_chat(chat_id: int):
@@ -112,7 +88,6 @@ def save_chat(chat_id: int):
         with open(CHAT_PATH, "w", encoding="utf-8") as f:
             json.dump(chats, f)
 
-# ---------------- Providers activation ----------------
 def build_active_providers():
     providers: List[WeatherProvider] = [OpenMeteoProvider()]
     names = ["Open-Meteo"]
@@ -124,7 +99,6 @@ def build_active_providers():
         providers.append(VisualCrossingProvider(VISUALCROSSING_API_KEY)); names.append("VisualCrossing")
     return providers, names
 
-# ---------------- Night & Moon ----------------
 def night_window(date_local: dt.date, tz: ZoneInfo) -> Tuple[dt.datetime, dt.datetime]:
     loc = LocationInfo(latitude=LAT, longitude=LON)
     s1 = sun(loc.observer, date=date_local, tzinfo=tz)
@@ -141,26 +115,19 @@ def moon_info(date_local: dt.date, tz: ZoneInfo):
     age = float(amoon.phase(date_local))
     frac = (1.0 - math.cos(2*math.pi*age/29.530588)) / 2.0
     illum = max(0.0, min(1.0, frac)) * 100.0
-
     def _safe(func, day):
-        try:
-            return func(loc.observer, date=day, tzinfo=tz)
-        except Exception:
-            return None
-
+        try: return func(loc.observer, date=day, tzinfo=tz)
+        except Exception: return None
     rise0 = _safe(amoon.moonrise, date_local)
     set0  = _safe(amoon.moonset,  date_local)
     rise1 = _safe(amoon.moonrise, date_local + dt.timedelta(days=1))
     set1  = _safe(amoon.moonset,  date_local + dt.timedelta(days=1))
-
-    intervals: List[Tuple[dt.datetime, dt.datetime]] = []
+    intervals = []
     if rise0 and set0:
-        if rise0 < set0:
-            intervals.append((rise0, set0))
+        if rise0 < set0: intervals.append((rise0, set0))
         else:
             intervals.append((rise0, date_local + dt.timedelta(days=1)))
-            if set1:
-                intervals.append((date_local + dt.timedelta(days=1), set1))
+            if set1: intervals.append((date_local + dt.timedelta(days=1), set1))
     elif rise0 and not set0:
         intervals.append((rise0, date_local + dt.timedelta(days=1)))
     elif set0 and not rise0:
@@ -172,11 +139,10 @@ def moon_info(date_local: dt.date, tz: ZoneInfo):
 
 def classify_moon_vs_night(dusk: dt.datetime, dawn: dt.datetime, tz: ZoneInfo):
     illum, age, intervals = moon_info(dusk.date(), tz)
-    overlaps: List[Tuple[dt.datetime, dt.datetime]] = []
+    overlaps = []
     for a,b in intervals:
         s = max(a, dusk); e = min(b, dawn)
-        if s < e:
-            overlaps.append((s,e))
+        if s < e: overlaps.append((s,e))
     if intervals and not overlaps:
         status = "вне ночного окна"
     elif overlaps:
@@ -194,14 +160,12 @@ def filter_by_moon(averaged: Dict[int, Dict[str, float]], dusk: dt.datetime, daw
     blocks = [(int(a.timestamp()), int(b.timestamp())) for a,b in overlaps]
     return {ts:v for ts,v in averaged.items() if not any(a <= ts < b for a,b in blocks)}
 
-# ---------------- Fetch & Aggregate ----------------
 async def fetch_all_providers(start: dt.datetime, end: dt.datetime):
     providers, names = build_active_providers()
     results: Dict[int, Dict[str, List[float]]] = {}
     contrib = {n: 0 for n in names}
     tasks = [p.fetch_hours(LAT, LON, start, end) for p in providers]
     batches = await asyncio.gather(*tasks, return_exceptions=True)
-
     import math as _math
     for name, batch in zip(names, batches):
         if isinstance(batch, Exception):
@@ -214,8 +178,7 @@ async def fetch_all_providers(start: dt.datetime, end: dt.datetime):
                 cell["cloud"].append(cloud); contrib[name] += 1
             if "precip_prob" in point:
                 cell["precip_prob"].append(point["precip_prob"])
-
-    averaged: Dict[int, Dict[str, float]] = {}
+    averaged = {}
     for ts, vals in results.items():
         if not vals["cloud"] and not vals["precip_prob"]:
             continue
@@ -225,33 +188,30 @@ async def fetch_all_providers(start: dt.datetime, end: dt.datetime):
     averaged = dict(sorted(averaged.items()))
     return averaged, contrib, names
 
-def summarize_windows(averaged: Dict[int, Dict[str, float]]) -> List[Tuple[int,int]]:
-    allowed_ts = [ts for ts, v in averaged.items()
-                  if v["cloud"] <= CLOUD_THRESHOLD and v["precip_prob"] <= PRECIP_THRESHOLD]
+def summarize_windows(averaged: Dict[int, Dict[str, float]]):
+    allowed_ts = [ts for ts, v in averaged.items() if v["cloud"] <= CLOUD_THRESHOLD and v["precip_prob"] <= PRECIP_THRESHOLD]
     if not allowed_ts: return []
     allowed_ts.sort()
-    windows: List[Tuple[int,int]] = []
+    windows = []
     start = allowed_ts[0]; prev = start
     for ts in allowed_ts[1:]:
-        if ts - prev == 3600:
-            prev = ts
+        if ts - prev == 3600: prev = ts
         else:
             windows.append((start, prev+3600)); start = ts; prev = ts
     windows.append((start, prev+3600))
     out = []
     for a,b in windows:
-        if (b-a)/3600.0 >= MIN_WINDOW_HOURS:
-            out.append((a,b))
+        if (b-a)/3600.0 >= MIN_WINDOW_HOURS: out.append((a,b))
     return out
 
-def compute_clear_fraction(averaged: Dict[int, Dict[str, float]], dusk: dt.datetime, dawn: dt.datetime) -> float:
+def compute_clear_fraction(averaged, dusk, dawn):
     if not averaged: return 0.0
     hrs = [ts for ts in averaged.keys() if int(dusk.timestamp()) <= ts < int(dawn.timestamp())]
     if not hrs: return 0.0
     good = [ts for ts in hrs if averaged[ts]["cloud"] <= CLOUD_THRESHOLD and averaged[ts]["precip_prob"] <= PRECIP_THRESHOLD]
     return 100.0 * len(good) / len(hrs)
 
-def make_summary_line(clear_pct: float, windows: List[Tuple[int,int]], tz: ZoneInfo) -> str:
+def make_summary_line(clear_pct, windows, tz):
     if clear_pct >= CLEAR_NIGHT_THRESHOLD and windows:
         return f"🌙 Сегодня почти вся ночь ясная — отличные условия для съёмки! (ясных часов: {clear_pct:.0f}%)"
     if windows:
@@ -259,12 +219,9 @@ def make_summary_line(clear_pct: float, windows: List[Tuple[int,int]], tz: ZoneI
         return f"🌥 Просветы возможны с {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')} до {dt.datetime.fromtimestamp(b, tz).strftime('%H:%M')} — можно попробовать."
     return "☁️ Всё небо затянуто — съёмку отменяем."
 
-def fmt_report(date_local: dt.date, dusk: dt.datetime, dawn: dt.datetime,
-               averaged: Dict[int, Dict[str, float]], windows: List[Tuple[int,int]],
-               tz: ZoneInfo, contrib: Dict[str, int]) -> str:
+def fmt_report(date_local, dusk, dawn, averaged, windows, tz, contrib):
     clear_pct = compute_clear_fraction(averaged, dusk, dawn)
     header = make_summary_line(clear_pct, windows, tz)
-
     illum, age, intervals, overlaps, status = classify_moon_vs_night(dusk, dawn, tz)
     moon_line = f"Луна: {illum:.0f}% (возраст {age:.1f} д)"
     if status == "над горизонтом" and overlaps:
@@ -272,10 +229,9 @@ def fmt_report(date_local: dt.date, dusk: dt.datetime, dawn: dt.datetime,
         moon_line += " • над горизонтом: " + ", ".join(spans)
     elif status == "вне ночного окна" and intervals:
         spans = [f"{a.strftime('%d.%m %H:%M')}–{b.strftime('%d.%m %H:%M')}" for a,b in intervals]
-        moon_line += " • над горизонтом (вне ночного окна): " + ", ".join(spans)
+        moon_line += " • над горизоризонтом (вне ночного окна): " + ", ".join(spans)
     else:
         moon_line += " • данные о восходе/заходе недоступны"
-
     if not averaged:
         base = "Нет данных с погодных сервисов на выбранный интервал."
     elif not windows:
@@ -293,14 +249,12 @@ def fmt_report(date_local: dt.date, dusk: dt.datetime, dawn: dt.datetime,
             avgc = sum(hours)/len(hours) if hours else 0.0
             parts.append(f"• {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')}–{dt.datetime.fromtimestamp(b, tz).strftime('%H:%M')}  (ср. облачн.: {avgc:.0f}%)")
         base = "\n".join(parts)
-
     if SHOW_SOURCES:
         used = [f"{k}:{v}" for k,v in contrib.items() if v > 0]
         base += "\n\nИсточник(и): " + (", ".join(used) if used else "нет данных")
-
     return header + "\n\n" + base
 
-async def build_message(date_local: dt.date, tz: ZoneInfo) -> str:
+async def build_message(date_local, tz):
     dusk, dawn = night_window(date_local, tz)
     start_utc = dusk.astimezone(dt.timezone.utc); end_utc = dawn.astimezone(dt.timezone.utc)
     averaged, contrib, _ = await fetch_all_providers(start_utc, end_utc)
@@ -308,8 +262,7 @@ async def build_message(date_local: dt.date, tz: ZoneInfo) -> str:
     windows = summarize_windows(averaged2)
     return fmt_report(date_local, dusk, dawn, averaged2, windows, tz, contrib)
 
-# ---------------- Telegram handlers & error logging ----------------
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update, context):
     save_chat(update.effective_chat.id)
     await update.message.reply_text(
         "Привет! Команды:\n"
@@ -320,17 +273,17 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/moonfilter <0|1> — выкл/вкл учёт Луны\n"
     )
 
-async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def now(update, context):
     tz = ZoneInfo(TIMEZONE)
     today = dt.datetime.now(tz).date()
     await update.message.reply_text(await build_message(today, tz))
 
-async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def tomorrow(update, context):
     tz = ZoneInfo(TIMEZONE)
     nxt = (dt.datetime.now(tz).date() + dt.timedelta(days=1))
     await update.message.reply_text(await build_message(nxt, tz))
 
-async def setthresholds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def setthresholds(update, context):
     global CLOUD_THRESHOLD, PRECIP_THRESHOLD
     try:
         c = float(context.args[0]); p = float(context.args[1])
@@ -339,7 +292,7 @@ async def setthresholds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Используйте формат: /setthresholds 40 20")
 
-async def setclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def setclear(update, context):
     global CLEAR_NIGHT_THRESHOLD
     try:
         v = float(context.args[0])
@@ -348,7 +301,7 @@ async def setclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Используйте: /setclear 60")
 
-async def moonfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def moonfilter(update, context):
     global USE_MOON_FILTER
     try:
         val = int(context.args[0])
@@ -357,10 +310,9 @@ async def moonfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Используйте: /moonfilter 1  (или 0)")
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+async def on_error(update, context):
     log.exception("Unhandled error while processing update: %s", update)
 
-# ---------------- Daily notify ----------------
 async def daily_job(app: Application):
     tz = ZoneInfo(TIMEZONE)
     today = dt.datetime.now(tz).date()
@@ -374,25 +326,14 @@ async def daily_job(app: Application):
 def setup_scheduler(app: Application):
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
     trigger = CronTrigger(hour=DAILY_NOTIFY_HOUR, minute=DAILY_NOTIFY_MINUTE)
-    scheduler.add_job(
-        daily_job,
-        trigger,
-        args=[app],
-        coalesce=True,
-        misfire_grace_time=600
-    )
+    scheduler.add_job(daily_job, trigger, args=[app], coalesce=True, misfire_grace_time=600)
     scheduler.start()
     log.info("Scheduler started for %02d:%02d %s", DAILY_NOTIFY_HOUR, DAILY_NOTIFY_MINUTE, TIMEZONE)
 
-# ---------------- Main (webhook + aiohttp health) ----------------
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN is not set")
-    if not PUBLIC_URL or not WEBHOOK_PATH:
-        raise RuntimeError("PUBLIC_URL and WEBHOOK_PATH must be set for webhook mode")
-
     application = Application.builder().token(TELEGRAM_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("now", now))
     application.add_handler(CommandHandler("tomorrow", tomorrow))
@@ -400,29 +341,9 @@ def main():
     application.add_handler(CommandHandler("setclear", setclear))
     application.add_handler(CommandHandler("moonfilter", moonfilter))
     application.add_error_handler(on_error)
-
     setup_scheduler(application)
-
-    # Use our own aiohttp app to expose "/" = OK for uptime pingers
-    from aiohttp import web
-    aio = web.Application()
-    async def health(request):
-        return web.Response(text="OK")
-    aio.router.add_get("/", health)
-
-    path_clean = WEBHOOK_PATH.strip("/")
-    public_clean = PUBLIC_URL.rstrip("/")
-
-    log.info("Starting webhook at %s/%s (port %d)", public_clean, path_clean, PORT)
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=path_clean,
-        webhook_url=f"{public_clean}/{path_clean}",
-        webhook_app=aio,
-        close_loop=False,
-        drop_pending_updates=True,
-    )
+    application.run_polling(allowed_updates=None, close_loop=False, drop_pending_updates=True, poll_interval=1.5)
 
 if __name__ == "__main__":
     main()
+# --- end ---
