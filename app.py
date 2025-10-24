@@ -1,7 +1,41 @@
 # -*- coding: utf-8 -*-
-# Webhook app without custom web_app route
+"""
+YASNOch Telegram astro bot — webhook mode for Render.com (PTB 21.4)
+- Webhook instead of polling (no "Conflict: other getUpdates")
+- aiohttp health route at "/" → 200 OK (for UptimeRobot)
+- APScheduler daily digest (15:00 local by default)
+- Clear-night summary + optional Moon filtering
+- Multi-provider aggregation (Open-Meteo + optional OpenWeather/Windy/VisualCrossing)
 
-import os, json, math, asyncio
+Requirements (requirements.txt):
+    python-telegram-bot[webhooks]==21.4
+    apscheduler
+    astral
+    python-dotenv
+
+Environment (Render → Environment):
+    TELEGRAM_TOKEN=...
+    PUBLIC_URL=https://yasnoch.onrender.com
+    WEBHOOK_PATH=hook-<random_string>
+    LAT=55.85
+    LON=38.45
+    TIMEZONE=Europe/Moscow
+    # Optional:
+    # OPENWEATHER_API_KEY=...
+    # WINDY_API_KEY=...
+    # VISUALCROSSING_API_KEY=...
+    # SHOW_SOURCES=1
+    # CLOUD_THRESHOLD=35
+    # PRECIP_THRESHOLD=20
+    # MIN_WINDOW_HOURS=1
+    # CLEAR_NIGHT_THRESHOLD=60
+    # USE_MOON_FILTER=1
+    # MOON_MAX_ILLUM=40
+    # DAILY_NOTIFY_HOUR=15
+    # DAILY_NOTIFY_MINUTE=0
+"""
+
+import os, json, math, asyncio, logging
 import datetime as dt
 from typing import List, Dict, Tuple
 
@@ -17,13 +51,25 @@ from apscheduler.triggers.cron import CronTrigger
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from providers import OpenMeteoProvider, OpenWeatherProvider, WindyProvider, VisualCrossingProvider, WeatherProvider
+# Providers module must be present in your project root
+from providers import (
+    OpenMeteoProvider, OpenWeatherProvider, WindyProvider,
+    VisualCrossingProvider, WeatherProvider
+)
 
+# ---------------- Logging ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+log = logging.getLogger("yasnoch")
+
+# ---------------- Config ----------------
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-PUBLIC_URL     = os.getenv("PUBLIC_URL")
-WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH")
+PUBLIC_URL     = os.getenv("PUBLIC_URL")     # e.g. https://yasnoch.onrender.com
+WEBHOOK_PATH   = os.getenv("WEBHOOK_PATH")   # e.g. hook-<random-string>
 PORT           = int(os.getenv("PORT", "8000"))
 
 OPENWEATHER_API_KEY    = (os.getenv("OPENWEATHER_API_KEY", "") or "").strip() or None
@@ -49,11 +95,14 @@ MOON_MAX_ILLUM  = float(os.getenv("MOON_MAX_ILLUM",  "40"))
 CHAT_DB   = os.getenv("CHAT_DB", "chat_ids.json")
 CHAT_PATH = os.path.join(os.path.dirname(__file__), CHAT_DB)
 
+# ---------------- Storage (chat list) ----------------
 def load_chats() -> List[int]:
     if os.path.exists(CHAT_PATH):
         with open(CHAT_PATH, "r", encoding="utf-8") as f:
-            try: return json.load(f)
-            except Exception: return []
+            try:
+                return json.load(f)
+            except Exception:
+                return []
     return []
 
 def save_chat(chat_id: int):
@@ -63,6 +112,7 @@ def save_chat(chat_id: int):
         with open(CHAT_PATH, "w", encoding="utf-8") as f:
             json.dump(chats, f)
 
+# ---------------- Providers activation ----------------
 def build_active_providers():
     providers: List[WeatherProvider] = [OpenMeteoProvider()]
     names = ["Open-Meteo"]
@@ -74,6 +124,7 @@ def build_active_providers():
         providers.append(VisualCrossingProvider(VISUALCROSSING_API_KEY)); names.append("VisualCrossing")
     return providers, names
 
+# ---------------- Night & Moon ----------------
 def night_window(date_local: dt.date, tz: ZoneInfo) -> Tuple[dt.datetime, dt.datetime]:
     loc = LocationInfo(latitude=LAT, longitude=LON)
     s1 = sun(loc.observer, date=date_local, tzinfo=tz)
@@ -92,8 +143,10 @@ def moon_info(date_local: dt.date, tz: ZoneInfo):
     illum = max(0.0, min(1.0, frac)) * 100.0
 
     def _safe(func, day):
-        try: return func(loc.observer, date=day, tzinfo=tz)
-        except Exception: return None
+        try:
+            return func(loc.observer, date=day, tzinfo=tz)
+        except Exception:
+            return None
 
     rise0 = _safe(amoon.moonrise, date_local)
     set0  = _safe(amoon.moonset,  date_local)
@@ -102,10 +155,12 @@ def moon_info(date_local: dt.date, tz: ZoneInfo):
 
     intervals: List[Tuple[dt.datetime, dt.datetime]] = []
     if rise0 and set0:
-        if rise0 < set0: intervals.append((rise0, set0))
+        if rise0 < set0:
+            intervals.append((rise0, set0))
         else:
             intervals.append((rise0, date_local + dt.timedelta(days=1)))
-            if set1: intervals.append((date_local + dt.timedelta(days=1), set1))
+            if set1:
+                intervals.append((date_local + dt.timedelta(days=1), set1))
     elif rise0 and not set0:
         intervals.append((rise0, date_local + dt.timedelta(days=1)))
     elif set0 and not rise0:
@@ -120,7 +175,8 @@ def classify_moon_vs_night(dusk: dt.datetime, dawn: dt.datetime, tz: ZoneInfo):
     overlaps: List[Tuple[dt.datetime, dt.datetime]] = []
     for a,b in intervals:
         s = max(a, dusk); e = min(b, dawn)
-        if s < e: overlaps.append((s,e))
+        if s < e:
+            overlaps.append((s,e))
     if intervals and not overlaps:
         status = "вне ночного окна"
     elif overlaps:
@@ -138,6 +194,7 @@ def filter_by_moon(averaged: Dict[int, Dict[str, float]], dusk: dt.datetime, daw
     blocks = [(int(a.timestamp()), int(b.timestamp())) for a,b in overlaps]
     return {ts:v for ts,v in averaged.items() if not any(a <= ts < b for a,b in blocks)}
 
+# ---------------- Fetch & Aggregate ----------------
 async def fetch_all_providers(start: dt.datetime, end: dt.datetime):
     providers, names = build_active_providers()
     results: Dict[int, Dict[str, List[float]]] = {}
@@ -176,13 +233,15 @@ def summarize_windows(averaged: Dict[int, Dict[str, float]]) -> List[Tuple[int,i
     windows: List[Tuple[int,int]] = []
     start = allowed_ts[0]; prev = start
     for ts in allowed_ts[1:]:
-        if ts - prev == 3600: prev = ts
+        if ts - prev == 3600:
+            prev = ts
         else:
             windows.append((start, prev+3600)); start = ts; prev = ts
     windows.append((start, prev+3600))
     out = []
     for a,b in windows:
-        if (b-a)/3600.0 >= MIN_WINDOW_HOURS: out.append((a,b))
+        if (b-a)/3600.0 >= MIN_WINDOW_HOURS:
+            out.append((a,b))
     return out
 
 def compute_clear_fraction(averaged: Dict[int, Dict[str, float]], dusk: dt.datetime, dawn: dt.datetime) -> float:
@@ -249,6 +308,7 @@ async def build_message(date_local: dt.date, tz: ZoneInfo) -> str:
     windows = summarize_windows(averaged2)
     return fmt_report(date_local, dusk, dawn, averaged2, windows, tz, contrib)
 
+# ---------------- Telegram handlers & error logging ----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_chat(update.effective_chat.id)
     await update.message.reply_text(
@@ -297,6 +357,10 @@ async def moonfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Используйте: /moonfilter 1  (или 0)")
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error while processing update: %s", update)
+
+# ---------------- Daily notify ----------------
 async def daily_job(app: Application):
     tz = ZoneInfo(TIMEZONE)
     today = dt.datetime.now(tz).date()
@@ -305,7 +369,7 @@ async def daily_job(app: Application):
         try:
             await app.bot.send_message(chat_id=chat_id, text=msg)
         except Exception:
-            pass
+            log.exception("Failed to send daily message to %s", chat_id)
 
 def setup_scheduler(app: Application):
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
@@ -318,7 +382,9 @@ def setup_scheduler(app: Application):
         misfire_grace_time=600
     )
     scheduler.start()
+    log.info("Scheduler started for %02d:%02d %s", DAILY_NOTIFY_HOUR, DAILY_NOTIFY_MINUTE, TIMEZONE)
 
+# ---------------- Main (webhook + aiohttp health) ----------------
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN is not set")
@@ -333,16 +399,27 @@ def main():
     application.add_handler(CommandHandler("setthresholds", setthresholds))
     application.add_handler(CommandHandler("setclear", setclear))
     application.add_handler(CommandHandler("moonfilter", moonfilter))
+    application.add_error_handler(on_error)
 
     setup_scheduler(application)
 
+    # Use our own aiohttp app to expose "/" = OK for uptime pingers
+    from aiohttp import web
+    aio = web.Application()
+    async def health(request):
+        return web.Response(text="OK")
+    aio.router.add_get("/", health)
+
     path_clean = WEBHOOK_PATH.strip("/")
     public_clean = PUBLIC_URL.rstrip("/")
+
+    log.info("Starting webhook at %s/%s (port %d)", public_clean, path_clean, PORT)
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=path_clean,
         webhook_url=f"{public_clean}/{path_clean}",
+        web_app=aio,
         close_loop=False,
         drop_pending_updates=True,
     )
