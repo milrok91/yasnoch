@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-# (Full content as in previous cell)
-# To keep output short here, we re-emit the full file.
-# --- begin ---
+# (See long header in previous cell) — full file included below.
+
 import os, json, math, asyncio, logging, threading
 import datetime as dt
 from typing import List, Dict, Tuple
@@ -26,6 +25,7 @@ from providers import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("yasnoch")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 def _start_keepalive_server():
     port = int(os.getenv("PORT", "8000"))
@@ -55,6 +55,7 @@ def _start_keepalive_server():
 _start_keepalive_server()
 
 load_dotenv()
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENWEATHER_API_KEY    = (os.getenv("OPENWEATHER_API_KEY", "") or "").strip() or None
 WINDY_API_KEY          = (os.getenv("WINDY_API_KEY", "") or "").strip() or None
@@ -62,6 +63,7 @@ VISUALCROSSING_API_KEY = (os.getenv("VISUALCROSSING_API_KEY", "") or "").strip()
 LAT  = float(os.getenv("LAT", "55.85"))
 LON  = float(os.getenv("LON", "38.45"))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+SCHED_TZ = ZoneInfo(TIMEZONE)
 CLOUD_THRESHOLD   = float(os.getenv("CLOUD_THRESHOLD",   "35"))
 PRECIP_THRESHOLD  = float(os.getenv("PRECIP_THRESHOLD",  "20"))
 MIN_WINDOW_HOURS  = float(os.getenv("MIN_WINDOW_HOURS",  "1.0"))
@@ -73,6 +75,7 @@ USE_MOON_FILTER = os.getenv("USE_MOON_FILTER", "0") == "1"
 MOON_MAX_ILLUM  = float(os.getenv("MOON_MAX_ILLUM",  "40"))
 CHAT_DB   = os.getenv("CHAT_DB", "chat_ids.json")
 CHAT_PATH = os.path.join(os.path.dirname(__file__), CHAT_DB)
+scheduler_ref = None
 
 def load_chats() -> List[int]:
     if os.path.exists(CHAT_PATH):
@@ -216,7 +219,7 @@ def make_summary_line(clear_pct, windows, tz):
         return f"🌙 Сегодня почти вся ночь ясная — отличные условия для съёмки! (ясных часов: {clear_pct:.0f}%)"
     if windows:
         a,b = max(windows, key=lambda w: w[1]-w[0])
-        return f"🌥 Просветы возможны с {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')} до {dt.datetime.fromtimestamp(b, tz).strftime('%H:%M')} — можно попробовать."
+        return f"🌥 Просветы возможны с {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')} до {dt.datetime.fromtimestamp(b, tz).strftime('%H:%М')} — можно попробовать."
     return "☁️ Всё небо затянуто — съёмку отменяем."
 
 def fmt_report(date_local, dusk, dawn, averaged, windows, tz, contrib):
@@ -228,8 +231,8 @@ def fmt_report(date_local, dusk, dawn, averaged, windows, tz, contrib):
         spans = [f"{a.strftime('%H:%M')}–{b.strftime('%H:%M')}" for a,b in overlaps]
         moon_line += " • над горизонтом: " + ", ".join(spans)
     elif status == "вне ночного окна" and intervals:
-        spans = [f"{a.strftime('%d.%m %H:%M')}–{b.strftime('%d.%m %H:%M')}" for a,b in intervals]
-        moon_line += " • над горизоризонтом (вне ночного окна): " + ", ".join(spans)
+        spans = [f"{a.strftime('%d.%m %H:%M')}–{b.strftime('%d.%m %H:%М')}" for a,b in intervals]
+        moon_line += " • над горизонтом (вне ночного окна): " + ", ".join(spans)
     else:
         moon_line += " • данные о восходе/заходе недоступны"
     if not averaged:
@@ -268,6 +271,9 @@ async def start_cmd(update, context):
         "Привет! Команды:\n"
         "/now — прогноз на ближайшую ночь\n"
         "/tomorrow — прогноз на завтрашнюю ночь\n"
+        "/notifynow — отправить дневную сводку прямо сейчас\n"
+        "/setnotify <час> <мин> — сменить время рассылки (локальное)\n"
+        "/when — когда следующий запуск\n"
         "/setthresholds <облачн%> <осадки%>\n"
         "/setclear <процент> — порог «ясной ночи» (по умолчанию 60)\n"
         "/moonfilter <0|1> — выкл/вкл учёт Луны\n"
@@ -282,6 +288,39 @@ async def tomorrow(update, context):
     tz = ZoneInfo(TIMEZONE)
     nxt = (dt.datetime.now(tz).date() + dt.timedelta(days=1))
     await update.message.reply_text(await build_message(nxt, tz))
+
+async def notifynow(update, context):
+    await update.message.reply_text("Пробую отправить дневную сводку…")
+    await daily_job(context.application)
+
+async def when(update, context):
+    global scheduler_ref
+    if scheduler_ref:
+        jobs = scheduler_ref.get_jobs()
+        if jobs and jobs[0].next_run_time:
+            local = jobs[0].next_run_time.astimezone(SCHED_TZ)
+            await update.message.reply_text(f"Следующий запуск: {local.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            return
+    await update.message.reply_text("Планировщик пока не запущен.")
+
+async def setnotify(update, context):
+    global DAILY_NOTIFY_HOUR, DAILY_NOTIFY_MINUTE, scheduler_ref
+    try:
+        h = int(context.args[0]); m = int(context.args[1])
+        if not (0 <= h < 24 and 0 <= m < 60):
+            raise ValueError
+        DAILY_NOTIFY_HOUR, DAILY_NOTIFY_MINUTE = h, m
+        if scheduler_ref:
+            scheduler_ref.remove_job("daily_job")
+            trigger = CronTrigger(hour=h, minute=m, timezone=SCHED_TZ)
+            scheduler_ref.add_job(
+                daily_job, trigger, args=[context.application],
+                coalesce=True, misfire_grace_time=3600,
+                max_instances=1, id="daily_job", replace_existing=True
+            )
+        await update.message.reply_text(f"Ок! Ежедневная сводка теперь в {h:02d}:{m:02d}.")
+    except Exception:
+        await update.message.reply_text("Используй: /setnotify <час> <мин> (например, /setnotify 16 30)")
 
 async def setthresholds(update, context):
     global CLOUD_THRESHOLD, PRECIP_THRESHOLD
@@ -324,11 +363,24 @@ async def daily_job(app: Application):
             log.exception("Failed to send daily message to %s", chat_id)
 
 def setup_scheduler(app: Application):
-    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-    trigger = CronTrigger(hour=DAILY_NOTIFY_HOUR, minute=DAILY_NOTIFY_MINUTE)
-    scheduler.add_job(daily_job, trigger, args=[app], coalesce=True, misfire_grace_time=600)
+    global scheduler_ref
+    scheduler = AsyncIOScheduler(timezone=SCHED_TZ)
+    trigger = CronTrigger(hour=DAILY_NOTIFY_HOUR, minute=DAILY_NOTIFY_MINUTE, timezone=SCHED_TZ)
+    scheduler.add_job(
+        daily_job,
+        trigger,
+        args=[app],
+        coalesce=True,
+        misfire_grace_time=3600,
+        max_instances=1,
+        id="daily_job",
+        replace_existing=True,
+    )
     scheduler.start()
+    scheduler_ref = scheduler
     log.info("Scheduler started for %02d:%02d %s", DAILY_NOTIFY_HOUR, DAILY_NOTIFY_MINUTE, TIMEZONE)
+    for job in scheduler.get_jobs():
+        log.info("Job %s next run at %s", job.id, job.next_run_time)
 
 def main():
     if not TELEGRAM_TOKEN:
@@ -337,6 +389,9 @@ def main():
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("now", now))
     application.add_handler(CommandHandler("tomorrow", tomorrow))
+    application.add_handler(CommandHandler("notifynow", notifynow))
+    application.add_handler(CommandHandler("when", when))
+    application.add_handler(CommandHandler("setnotify", setnotify))
     application.add_handler(CommandHandler("setthresholds", setthresholds))
     application.add_handler(CommandHandler("setclear", setclear))
     application.add_handler(CommandHandler("moonfilter", moonfilter))
@@ -346,4 +401,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# --- end ---
