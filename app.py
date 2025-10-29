@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-# (See long header in previous cell) — full file included below.
+# (See previous message for detailed header)
 
-import os, json, math, asyncio, logging, threading
+import os, json, math, asyncio, logging, threading, signal
 import datetime as dt
 from typing import List, Dict, Tuple
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import httpx
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from astral import LocationInfo
@@ -44,7 +45,7 @@ def _start_keepalive_server():
                 self._ok()
             else:
                 self.send_response(404); self.end_headers()
-        def log_message(self, *args): return
+        def log_message(self, *_): return
     try:
         srv = HTTPServer(("0.0.0.0", port), _Handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -76,6 +77,7 @@ MOON_MAX_ILLUM  = float(os.getenv("MOON_MAX_ILLUM",  "40"))
 CHAT_DB   = os.getenv("CHAT_DB", "chat_ids.json")
 CHAT_PATH = os.path.join(os.path.dirname(__file__), CHAT_DB)
 scheduler_ref = None
+application_ref = None
 
 def load_chats() -> List[int]:
     if os.path.exists(CHAT_PATH):
@@ -219,7 +221,7 @@ def make_summary_line(clear_pct, windows, tz):
         return f"🌙 Сегодня почти вся ночь ясная — отличные условия для съёмки! (ясных часов: {clear_pct:.0f}%)"
     if windows:
         a,b = max(windows, key=lambda w: w[1]-w[0])
-        return f"🌥 Просветы возможны с {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')} до {dt.datetime.fromtimestamp(b, tz).strftime('%H:%М')} — можно попробовать."
+        return f"🌥 Просветы возможны с {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')} до {dt.datetime.fromtimestamp(b, tz).strftime('%H:%M')} — можно попробовать."
     return "☁️ Всё небо затянуто — съёмку отменяем."
 
 def fmt_report(date_local, dusk, dawn, averaged, windows, tz, contrib):
@@ -231,7 +233,7 @@ def fmt_report(date_local, dusk, dawn, averaged, windows, tz, contrib):
         spans = [f"{a.strftime('%H:%M')}–{b.strftime('%H:%M')}" for a,b in overlaps]
         moon_line += " • над горизонтом: " + ", ".join(spans)
     elif status == "вне ночного окна" and intervals:
-        spans = [f"{a.strftime('%d.%m %H:%M')}–{b.strftime('%d.%m %H:%М')}" for a,b in intervals]
+        spans = [f"{a.strftime('%d.%m %H:%M')}–{b.strftime('%d.%m %H:%M')}" for a,b in intervals]
         moon_line += " • над горизонтом (вне ночного окна): " + ", ".join(spans)
     else:
         moon_line += " • данные о восходе/заходе недоступны"
@@ -265,7 +267,7 @@ async def build_message(date_local, tz):
     windows = summarize_windows(averaged2)
     return fmt_report(date_local, dusk, dawn, averaged2, windows, tz, contrib)
 
-async def start_cmd(update, context):
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_chat(update.effective_chat.id)
     await update.message.reply_text(
         "Привет! Команды:\n"
@@ -279,21 +281,21 @@ async def start_cmd(update, context):
         "/moonfilter <0|1> — выкл/вкл учёт Луны\n"
     )
 
-async def now(update, context):
+async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz = ZoneInfo(TIMEZONE)
     today = dt.datetime.now(tz).date()
     await update.message.reply_text(await build_message(today, tz))
 
-async def tomorrow(update, context):
+async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz = ZoneInfo(TIMEZONE)
     nxt = (dt.datetime.now(tz).date() + dt.timedelta(days=1))
     await update.message.reply_text(await build_message(nxt, tz))
 
-async def notifynow(update, context):
+async def notifynow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Пробую отправить дневную сводку…")
     await daily_job(context.application)
 
-async def when(update, context):
+async def when(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global scheduler_ref
     if scheduler_ref:
         jobs = scheduler_ref.get_jobs()
@@ -303,7 +305,7 @@ async def when(update, context):
             return
     await update.message.reply_text("Планировщик пока не запущен.")
 
-async def setnotify(update, context):
+async def setnotify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global DAILY_NOTIFY_HOUR, DAILY_NOTIFY_MINUTE, scheduler_ref
     try:
         h = int(context.args[0]); m = int(context.args[1])
@@ -322,7 +324,7 @@ async def setnotify(update, context):
     except Exception:
         await update.message.reply_text("Используй: /setnotify <час> <мин> (например, /setnotify 16 30)")
 
-async def setthresholds(update, context):
+async def setthresholds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CLOUD_THRESHOLD, PRECIP_THRESHOLD
     try:
         c = float(context.args[0]); p = float(context.args[1])
@@ -331,7 +333,7 @@ async def setthresholds(update, context):
     except Exception:
         await update.message.reply_text("Используйте формат: /setthresholds 40 20")
 
-async def setclear(update, context):
+async def setclear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CLEAR_NIGHT_THRESHOLD
     try:
         v = float(context.args[0])
@@ -340,7 +342,7 @@ async def setclear(update, context):
     except Exception:
         await update.message.reply_text("Используйте: /setclear 60")
 
-async def moonfilter(update, context):
+async def moonfilter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global USE_MOON_FILTER
     try:
         val = int(context.args[0])
@@ -349,7 +351,7 @@ async def moonfilter(update, context):
     except Exception:
         await update.message.reply_text("Используйте: /moonfilter 1  (или 0)")
 
-async def on_error(update, context):
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled error while processing update: %s", update)
 
 async def daily_job(app: Application):
@@ -367,25 +369,45 @@ def setup_scheduler(app: Application):
     scheduler = AsyncIOScheduler(timezone=SCHED_TZ)
     trigger = CronTrigger(hour=DAILY_NOTIFY_HOUR, minute=DAILY_NOTIFY_MINUTE, timezone=SCHED_TZ)
     scheduler.add_job(
-        daily_job,
-        trigger,
-        args=[app],
-        coalesce=True,
-        misfire_grace_time=3600,
-        max_instances=1,
-        id="daily_job",
-        replace_existing=True,
+        daily_job, trigger, args=[app],
+        coalesce=True, misfire_grace_time=3600, max_instances=1,
+        id="daily_job", replace_existing=True,
     )
+    async def self_ping(_app: Application):
+        url = f"http://127.0.0.1:{os.getenv('PORT', '8000')}/"
+        try:
+            await asyncio.to_thread(lambda: httpx.get(url, timeout=3))
+        except Exception:
+            pass
+    scheduler.add_job(self_ping, "interval", minutes=5, args=[app], id="self_ping", replace_existing=True)
     scheduler.start()
     scheduler_ref = scheduler
     log.info("Scheduler started for %02d:%02d %s", DAILY_NOTIFY_HOUR, DAILY_NOTIFY_MINUTE, TIMEZONE)
     for job in scheduler.get_jobs():
         log.info("Job %s next run at %s", job.id, job.next_run_time)
 
+async def _notify_startup(app: Application):
+    for chat_id in load_chats():
+        try:
+            await app.bot.send_message(chat_id=chat_id, text="✅ Бот запущен (startup)." )
+        except Exception:
+            pass
+
+def _on_stop_signal(signum, frame):
+    try:
+        loop = asyncio.get_event_loop()
+        if application_ref is not None:
+            for chat_id in load_chats():
+                loop.create_task(application_ref.bot.send_message(chat_id=chat_id, text="⚠️ Инстанс останавливается (SIGTERM)."))
+    except Exception:
+        pass
+
 def main():
+    global application_ref
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN is not set")
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application_ref = application
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("now", now))
     application.add_handler(CommandHandler("tomorrow", tomorrow))
@@ -397,6 +419,8 @@ def main():
     application.add_handler(CommandHandler("moonfilter", moonfilter))
     application.add_error_handler(on_error)
     setup_scheduler(application)
+    application.post_init = _notify_startup
+    signal.signal(signal.SIGTERM, _on_stop_signal)
     application.run_polling(allowed_updates=None, close_loop=False, drop_pending_updates=True, poll_interval=1.5)
 
 if __name__ == "__main__":
