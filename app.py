@@ -1,10 +1,28 @@
 # -*- coding: utf-8 -*-
 """
 YASNOch Telegram astro bot — POLLING + keepalive HTTP (PTB 21.4)
-Fix: robust datetime handling in moon overlap (avoids TypeError date vs datetime)
+
+Функции:
+- run_polling() (без вебхуков)
+- Мини HTTP-сервер на $PORT: "/", "/health", "/status" → 200 OK (для UptimeRobot/Render)
+- APScheduler:
+    • ежедневная рассылка прогноза на ночь
+    • self_ping каждые 5 минут (пингуем локальный HTTP)
+- Команды:
+    /now — ближайшая ночь
+    /tomorrow — завтрашняя ночь
+    /notifynow — рассылка сейчас
+    /setnotify H M — смена времени рассылки
+    /when — когда следующий запуск
+    /setthresholds облачн% осадки%
+    /setclear процент — порог «ясной ночи»
+    /moonfilter 0|1 — учёт Луны
+- Уведомления:
+    • при старте: "✅ Бот запущен (startup)"
+    • при остановке (SIGTERM): "⚠️ Инстанс останавливается (SIGTERM)" через httpx в Telegram
 """
 
-import os, json, math, asyncio, logging, threading, signal
+import os, json, math, asyncio, logging, threading, signal, time
 import datetime as dt
 from typing import List, Dict, Tuple, Optional
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -36,23 +54,32 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # ---------------- Keepalive HTTP (на $PORT) ----------------
 def _start_keepalive_server():
     port = int(os.getenv("PORT", "8000"))
+
     class _Handler(BaseHTTPRequestHandler):
         def _ok(self):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
+
         def do_GET(self):
             if self.path in ("/", "/health", "/status"):
-                self._ok(); self.wfile.write(b"OK")
+                self._ok()
+                self.wfile.write(b"OK")
             else:
-                self.send_response(404); self.end_headers()
+                self.send_response(404)
+                self.end_headers()
+
         def do_HEAD(self):
             if self.path in ("/", "/health", "/status"):
                 self._ok()
             else:
-                self.send_response(404); self.end_headers()
+                self.send_response(404)
+                self.end_headers()
+
         def log_message(self, *_):
+            # глушим стандартный лог http.server
             return
+
     try:
         srv = HTTPServer(("0.0.0.0", port), _Handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -97,7 +124,7 @@ application_ref: Optional[Application] = None
 
 # ---------------- Utils ----------------
 def ensure_dt(x, tz: ZoneInfo) -> dt.datetime:
-    """Приводим к timezone-aware datetime в tz (устраняет date vs datetime)."""
+    """Приводим к timezone-aware datetime в tz (устраняем date vs datetime)."""
     if isinstance(x, dt.datetime):
         return x if x.tzinfo else x.replace(tzinfo=tz)
     if isinstance(x, dt.date):
@@ -140,10 +167,13 @@ def night_window(date_local: dt.date, tz: ZoneInfo) -> Tuple[dt.datetime, dt.dat
     s2 = sun(loc.observer, date=(date_local + dt.timedelta(days=1)), tzinfo=tz)
     sunset  = ensure_dt(s1["sunset"], tz)
     sunrise = ensure_dt(s2["sunrise"], tz)
+
+    # берём ~астрономические сумерки +/- 90 минут
     dusk_astro = sunset + dt.timedelta(minutes=90)
     dawn_astro = sunrise - dt.timedelta(minutes=90)
     if dawn_astro <= dusk_astro:
-        dusk_astro = sunset; dawn_astro = sunrise
+        dusk_astro = sunset
+        dawn_astro = sunrise
     return dusk_astro, dawn_astro
 
 def moon_info(date_local: dt.date, tz: ZoneInfo):
@@ -173,7 +203,8 @@ def moon_info(date_local: dt.date, tz: ZoneInfo):
             intervals.append((rise0, set0))
         else:
             intervals.append((rise0, next_day))
-            if set1: intervals.append((next_day, set1))
+            if set1:
+                intervals.append((next_day, set1))
     elif rise0 and not set0:
         intervals.append((rise0, next_day))
     elif set0 and not rise0:
@@ -181,17 +212,21 @@ def moon_info(date_local: dt.date, tz: ZoneInfo):
     elif not rise0 and not set0 and rise1 and set1:
         if rise1 < set1:
             intervals.append((next_day, set1))
+
     return illum, age, intervals
 
 def classify_moon_vs_night(dusk: dt.datetime, dawn: dt.datetime, tz: ZoneInfo):
-    dusk = ensure_dt(dusk, tz); dawn = ensure_dt(dawn, tz)
+    dusk = ensure_dt(dusk, tz)
+    dawn = ensure_dt(dawn, tz)
     illum, age, intervals = moon_info(dusk.date(), tz)
     overlaps: List[Tuple[dt.datetime, dt.datetime]] = []
-    for a,b in intervals:
-        a = ensure_dt(a, tz); b = ensure_dt(b, tz)
-        s = max(a, dusk); e = min(b, dawn)
+    for a, b in intervals:
+        a = ensure_dt(a, tz)
+        b = ensure_dt(b, tz)
+        s = max(a, dusk)
+        e = min(b, dawn)
         if s < e:
-            overlaps.append((s,e))
+            overlaps.append((s, e))
     if intervals and not overlaps:
         status = "вне ночного окна"
     elif overlaps:
@@ -206,27 +241,30 @@ def filter_by_moon(averaged: Dict[int, Dict[str, float]], dusk: dt.datetime, daw
     illum, _, _, overlaps, _ = classify_moon_vs_night(dusk, dawn, tz)
     if illum <= MOON_MAX_ILLUM or not overlaps:
         return averaged
-    blocks = [(int(a.timestamp()), int(b.timestamp())) for a,b in overlaps]
-    return {ts:v for ts,v in averaged.items() if not any(a <= ts < b for a,b in blocks)}
+    blocks = [(int(a.timestamp()), int(b.timestamp())) for a, b in overlaps]
+    return {ts: v for ts, v in averaged.items() if not any(a <= ts < b for a, b in blocks)}
 
 # ---------------- Fetch & Aggregate ----------------
 async def fetch_all_providers(start: dt.datetime, end: dt.datetime):
     providers, names = build_active_providers()
     results: Dict[int, Dict[str, List[float]]] = {}
     contrib = {n: 0 for n in names}
+
     tasks = [p.fetch_hours(LAT, LON, start, end) for p in providers]
     batches = await asyncio.gather(*tasks, return_exceptions=True)
 
     import math as _math
     for name, batch in zip(names, batches):
         if isinstance(batch, Exception):
+            log.warning("Provider %s failed: %s", name, batch)
             continue
         for point in batch:
             ts = int(point["ts"])
             cell = results.setdefault(ts, {"cloud": [], "precip_prob": []})
             cloud = point.get("cloud", float("nan"))
             if not _math.isnan(cloud):
-                cell["cloud"].append(cloud); contrib[name] += 1
+                cell["cloud"].append(cloud)
+                contrib[name] += 1
             if "precip_prob" in point:
                 cell["precip_prob"].append(point["precip_prob"])
 
@@ -234,29 +272,36 @@ async def fetch_all_providers(start: dt.datetime, end: dt.datetime):
     for ts, vals in results.items():
         if not vals["cloud"] and not vals["precip_prob"]:
             continue
-        avg_cloud  = sum(vals["cloud"])/len(vals["cloud"]) if vals["cloud"] else 100.0
-        avg_precip = sum(vals["precip_prob"])/len(vals["precip_prob"]) if vals["precip_prob"] else 0.0
+        avg_cloud  = sum(vals["cloud"]) / len(vals["cloud"]) if vals["cloud"] else 100.0
+        avg_precip = sum(vals["precip_prob"]) / len(vals["precip_prob"]) if vals["precip_prob"] else 0.0
         averaged[ts] = {"cloud": avg_cloud, "precip_prob": avg_precip}
+
     averaged = dict(sorted(averaged.items()))
     return averaged, contrib, names
 
 def summarize_windows(averaged: Dict[int, Dict[str, float]]):
-    allowed_ts = [ts for ts, v in averaged.items() if v["cloud"] <= CLOUD_THRESHOLD and v["precip_prob"] <= PRECIP_THRESHOLD]
+    allowed_ts = [
+        ts for ts, v in averaged.items()
+        if v["cloud"] <= CLOUD_THRESHOLD and v["precip_prob"] <= PRECIP_THRESHOLD
+    ]
     if not allowed_ts:
         return []
     allowed_ts.sort()
-    windows = []
-    start = allowed_ts[0]; prev = start
+    windows: List[Tuple[int, int]] = []
+    start = allowed_ts[0]
+    prev = start
     for ts in allowed_ts[1:]:
         if ts - prev == 3600:
             prev = ts
         else:
-            windows.append((start, prev+3600)); start = ts; prev = ts
-    windows.append((start, prev+3600))
+            windows.append((start, prev + 3600))
+            start = ts
+            prev = ts
+    windows.append((start, prev + 3600))
     out = []
-    for a,b in windows:
-        if (b-a)/3600.0 >= MIN_WINDOW_HOURS:
-            out.append((a,b))
+    for a, b in windows:
+        if (b - a) / 3600.0 >= MIN_WINDOW_HOURS:
+            out.append((a, b))
     return out
 
 def compute_clear_fraction(averaged, dusk, dawn):
@@ -265,15 +310,22 @@ def compute_clear_fraction(averaged, dusk, dawn):
     hrs = [ts for ts in averaged.keys() if int(dusk.timestamp()) <= ts < int(dawn.timestamp())]
     if not hrs:
         return 0.0
-    good = [ts for ts in hrs if averaged[ts]["cloud"] <= CLOUD_THRESHOLD and averaged[ts]["precip_prob"] <= PRECIP_THRESHOLD]
+    good = [
+        ts for ts in hrs
+        if averaged[ts]["cloud"] <= CLOUD_THRESHOLD and averaged[ts]["precip_prob"] <= PRECIP_THRESHOLD
+    ]
     return 100.0 * len(good) / len(hrs)
 
 def make_summary_line(clear_pct, windows, tz):
     if clear_pct >= CLEAR_NIGHT_THRESHOLD and windows:
         return f"🌙 Сегодня почти вся ночь ясная — отличные условия для съёмки! (ясных часов: {clear_pct:.0f}%)"
     if windows:
-        a,b = max(windows, key=lambda w: w[1]-w[0])
-        return f"🌥 Просветы возможны с {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')} до {dt.datetime.fromtimestamp(b, tz).strftime('%H:%M')} — можно попробовать."
+        a, b = max(windows, key=lambda w: w[1] - w[0])
+        return (
+            f"🌥 Просветы возможны с "
+            f"{dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')} до "
+            f"{dt.datetime.fromtimestamp(b, tz).strftime('%H:%M')} — можно попробовать."
+        )
     return "☁️ Всё небо затянуто — съёмку отменяем."
 
 def fmt_report(date_local, dusk, dawn, averaged, windows, tz, contrib):
@@ -283,10 +335,10 @@ def fmt_report(date_local, dusk, dawn, averaged, windows, tz, contrib):
     illum, age, intervals, overlaps, status = classify_moon_vs_night(dusk, dawn, tz)
     moon_line = f"Луна: {illum:.0f}% (возраст {age:.1f} д)"
     if status == "над горизонтом" and overlaps:
-        spans = [f"{a.strftime('%H:%M')}–{b.strftime('%H:%M')}" for a,b in overlaps]
+        spans = [f"{a.strftime('%H:%M')}–{b.strftime('%H:%M')}" for a, b in overlaps]
         moon_line += " • над горизонтом: " + ", ".join(spans)
     elif status == "вне ночного окна" and intervals:
-        spans = [f"{a.strftime('%d.%m %H:%M')}–{b.strftime('%d.%m %H:%M')}" for a,b in intervals]
+        spans = [f"{a.strftime('%d.%m %H:%M')}–{b.strftime('%d.%m %H:%M')}" for a, b in intervals]
         moon_line += " • над горизонтом (вне ночного окна): " + ", ".join(spans)
     else:
         moon_line += " • данные о восходе/заходе недоступны"
@@ -294,30 +346,37 @@ def fmt_report(date_local, dusk, dawn, averaged, windows, tz, contrib):
     if not averaged:
         base = "Нет данных с погодных сервисов на выбранный интервал."
     elif not windows:
-        base = (f"Сегодня ({date_local.strftime('%d.%m.%Y')}) ночью над Ногинским районом облачно или осадки.\n"
-                f"Окно ночи: {dusk.strftime('%H:%M')}–{dawn.strftime('%H:%M')} МСК.\n" + moon_line)
+        base = (
+            f"Сегодня ({date_local.strftime('%d.%m.%Y')}) ночью над Ногинским районом облачно или осадки.\n"
+            f"Окно ночи: {dusk.strftime('%H:%M')}–{dawn.strftime('%H:%M')} МСК.\n" + moon_line
+        )
     else:
         parts = [
             f"Прогноз на ночь {date_local.strftime('%d.%m.%Y')} (Ногинский район):",
             f"Окно ночи: {dusk.strftime('%H:%M')}–{dawn.strftime('%H:%M')} МСК.",
             moon_line,
-            "Окна для съёмки (средняя облачность/осадки по источникам):"
+            "Окна для съёмки (средняя облачность/осадки по источникам):",
         ]
-        for a,b in windows:
+        for a, b in windows:
             hours = [averaged[ts]["cloud"] for ts in sorted(averaged) if a <= ts < b]
-            avgc = sum(hours)/len(hours) if hours else 0.0
-            parts.append(f"• {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')}–{dt.datetime.fromtimestamp(b, tz).strftime('%H:%M')}  (ср. облачн.: {avgc:.0f}%)")
+            avgc = sum(hours) / len(hours) if hours else 0.0
+            parts.append(
+                f"• {dt.datetime.fromtimestamp(a, tz).strftime('%H:%M')}–"
+                f"{dt.datetime.fromtimestamp(b, tz).strftime('%H:%M')} "
+                f"(ср. облачн.: {avgc:.0f}%)"
+            )
         base = "\n".join(parts)
 
     if SHOW_SOURCES:
-        used = [f"{k}:{v}" for k,v in contrib.items() if v > 0]
+        used = [f"{k}:{v}" for k, v in contrib.items() if v > 0]
         base += "\n\nИсточник(и): " + (", ".join(used) if used else "нет данных")
 
     return header + "\n\n" + base
 
 async def build_message(date_local, tz):
     dusk, dawn = night_window(date_local, tz)
-    start_utc = dusk.astimezone(dt.timezone.utc); end_utc = dawn.astimezone(dt.timezone.utc)
+    start_utc = dusk.astimezone(dt.timezone.utc)
+    end_utc   = dawn.astimezone(dt.timezone.utc)
     averaged, contrib, _ = await fetch_all_providers(start_utc, end_utc)
     averaged2 = filter_by_moon(averaged, dusk, dawn, tz)
     windows = summarize_windows(averaged2)
@@ -422,9 +481,11 @@ async def daily_job(app: Application):
         except Exception:
             log.exception("Failed to send daily message to %s", chat_id)
 
+# ---------------- Scheduler + self_ping ----------------
 def setup_scheduler(app: Application):
     global scheduler_ref
     scheduler = AsyncIOScheduler(timezone=SCHED_TZ)
+
     trigger = CronTrigger(hour=DAILY_NOTIFY_HOUR, minute=DAILY_NOTIFY_MINUTE, timezone=SCHED_TZ)
     scheduler.add_job(
         daily_job,
@@ -437,14 +498,21 @@ def setup_scheduler(app: Application):
         replace_existing=True,
     )
 
-    # Самопинг локального HTTP — каждые 5 минут
     async def self_ping(_app: Application):
         url = f"http://127.0.0.1:{os.getenv('PORT', '8000')}/"
         try:
             await asyncio.to_thread(lambda: httpx.get(url, timeout=3))
         except Exception:
             pass
-    scheduler.add_job(self_ping, "interval", minutes=5, args=[app], id="self_ping", replace_existing=True)
+
+    scheduler.add_job(
+        self_ping,
+        "interval",
+        minutes=5,
+        args=[app],
+        id="self_ping",
+        replace_existing=True,
+    )
 
     scheduler.start()
     scheduler_ref = scheduler
@@ -454,18 +522,47 @@ def setup_scheduler(app: Application):
 
 # ---------------- Startup/Shutdown notifications ----------------
 async def _notify_startup(app: Application):
+    # через PTB
     for chat_id in load_chats():
         try:
             await app.bot.send_message(chat_id=chat_id, text="✅ Бот запущен (startup).")
         except Exception:
             pass
+    # дубль через httpx (не обязательно, но пусть будет)
+    try:
+        token = os.getenv("TELEGRAM_TOKEN", "")
+        if token:
+            for cid in load_chats():
+                try:
+                    await asyncio.to_thread(
+                        lambda: httpx.post(
+                            f"https://api.telegram.org/bot{token}/sendMessage",
+                            json={"chat_id": cid, "text": "✅ Бот запущен (startup, httpx)."},
+                            timeout=2.0,
+                        )
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 def _on_stop_signal(signum, frame):
+    # прямой HTTP в Telegram, минуя PTB, чтобы успеть до убийства процесса
     try:
-        loop = asyncio.get_event_loop()
-        if application_ref is not None:
-            for chat_id in load_chats():
-                loop.create_task(application_ref.bot.send_message(chat_id=chat_id, text="⚠️ Инстанс останавливается (SIGTERM)."))
+        token = os.getenv("TELEGRAM_TOKEN", "")
+        chats = load_chats()
+        if token and chats:
+            for cid in chats:
+                try:
+                    httpx.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": cid, "text": "⚠️ Инстанс останавливается (SIGTERM)."},
+                        timeout=2.0,
+                    )
+                except Exception:
+                    pass
+            # даём сети шанс доотправить запросы
+            time.sleep(1.2)
     except Exception:
         pass
 
